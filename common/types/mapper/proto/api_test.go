@@ -235,6 +235,16 @@ func TestDescribeWorkflowExecutionResponse(t *testing.T) {
 		assert.Equal(t, item, ToDescribeWorkflowExecutionResponse(FromDescribeWorkflowExecutionResponse(item)))
 	}
 }
+func TestDiagnoseWorkflowExecutionRequest(t *testing.T) {
+	for _, item := range []*types.DiagnoseWorkflowExecutionRequest{nil, {}, &testdata.DiagnoseWorkflowExecutionRequest} {
+		assert.Equal(t, item, ToDiagnoseWorkflowExecutionRequest(FromDiagnoseWorkflowExecutionRequest(item)))
+	}
+}
+func TestDiagnoseWorkflowExecutionResponse(t *testing.T) {
+	for _, item := range []*types.DiagnoseWorkflowExecutionResponse{nil, {}, &testdata.DiagnoseWorkflowExecutionResponse} {
+		assert.Equal(t, item, ToDiagnoseWorkflowExecutionResponse(FromDiagnoseWorkflowExecutionResponse(item)))
+	}
+}
 func TestExternalWorkflowExecutionCancelRequestedEventAttributes(t *testing.T) {
 	for _, item := range []*types.ExternalWorkflowExecutionCancelRequestedEventAttributes{nil, {}, &testdata.ExternalWorkflowExecutionCancelRequestedEventAttributes} {
 		assert.Equal(t, item, ToExternalWorkflowExecutionCancelRequestedEventAttributes(FromExternalWorkflowExecutionCancelRequestedEventAttributes(item)))
@@ -281,7 +291,7 @@ func TestHealthResponse(t *testing.T) {
 	}
 }
 func TestHistory(t *testing.T) {
-	for _, item := range []*types.History{nil, {}, &testdata.History} {
+	for _, item := range []*types.History{nil, &testdata.History} {
 		assert.Equal(t, item, ToHistory(FromHistory(item)))
 	}
 }
@@ -862,7 +872,7 @@ func TestDataBlobArray(t *testing.T) {
 	}
 }
 func TestHistoryEventArray(t *testing.T) {
-	for _, item := range [][]*types.HistoryEvent{nil, {}, testdata.HistoryEventArray} {
+	for _, item := range [][]*types.HistoryEvent{{}, testdata.HistoryEventArray} {
 		assert.Equal(t, item, ToHistoryEventArray(FromHistoryEventArray(item)))
 	}
 }
@@ -1071,5 +1081,98 @@ func TestFailoverInfo(t *testing.T) {
 func TestDescribeTaskListResponseMap(t *testing.T) {
 	for _, item := range []map[string]*types.DescribeTaskListResponse{nil, {}, testdata.DescribeTaskListResponseMap} {
 		assert.Equal(t, item, ToDescribeTaskListResponseMap(FromDescribeTaskListResponseMap(item)))
+	}
+}
+
+func TestAPITaskListPartitionConfig(t *testing.T) {
+	for _, item := range []*types.TaskListPartitionConfig{nil, {}, &testdata.TaskListPartitionConfig} {
+		assert.Equal(t, item, ToAPITaskListPartitionConfig(FromAPITaskListPartitionConfig(item)))
+	}
+}
+
+func TestToAPITaskListPartitionConfig(t *testing.T) {
+	cases := []struct {
+		name     string
+		config   *apiv1.TaskListPartitionConfig
+		expected *types.TaskListPartitionConfig
+	}{
+		{
+			name: "happy path",
+			config: &apiv1.TaskListPartitionConfig{
+				Version:            1,
+				NumReadPartitions:  2,
+				NumWritePartitions: 2,
+				ReadPartitions: map[int32]*apiv1.TaskListPartition{
+					0: {IsolationGroups: []string{"foo"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+				WritePartitions: map[int32]*apiv1.TaskListPartition{
+					0: {IsolationGroups: []string{"baz"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+			},
+			expected: &types.TaskListPartitionConfig{
+				Version: 1,
+				ReadPartitions: map[int]*types.TaskListPartition{
+					0: {IsolationGroups: []string{"foo"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+				WritePartitions: map[int]*types.TaskListPartition{
+					0: {IsolationGroups: []string{"baz"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+			},
+		},
+		{
+			name: "numbers only",
+			config: &apiv1.TaskListPartitionConfig{
+				Version:            1,
+				NumReadPartitions:  2,
+				NumWritePartitions: 2,
+			},
+			expected: &types.TaskListPartitionConfig{
+				Version: 1,
+				ReadPartitions: map[int]*types.TaskListPartition{
+					0: {},
+					1: {},
+				},
+				WritePartitions: map[int]*types.TaskListPartition{
+					0: {},
+					1: {},
+				},
+			},
+		},
+		{
+			name: "number mismatch",
+			config: &apiv1.TaskListPartitionConfig{
+				Version:            1,
+				NumReadPartitions:  2,
+				NumWritePartitions: 1,
+				ReadPartitions: map[int32]*apiv1.TaskListPartition{
+					0: {IsolationGroups: []string{"foo"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+				WritePartitions: map[int32]*apiv1.TaskListPartition{
+					0: {IsolationGroups: []string{"baz"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+			},
+			expected: &types.TaskListPartitionConfig{
+				Version: 1,
+				ReadPartitions: map[int]*types.TaskListPartition{
+					0: {IsolationGroups: []string{"foo"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+				WritePartitions: map[int]*types.TaskListPartition{
+					0: {},
+				},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := ToAPITaskListPartitionConfig(tc.config)
+			assert.Equal(t, tc.expected, actual)
+		})
 	}
 }

@@ -24,11 +24,12 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
+	"go.uber.org/mock/gomock"
 
+	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/dynamicconfig"
 	"github.com/uber/cadence/common/log"
 	"github.com/uber/cadence/common/log/testlogger"
@@ -48,6 +49,7 @@ type (
 		mockShard            *shard.TestContext
 		mockPriorityAssigner *MockPriorityAssigner
 
+		timeSource    clock.TimeSource
 		metricsClient metrics.Client
 		logger        log.Logger
 
@@ -75,6 +77,7 @@ func (s *queueTaskProcessorSuite) SetupTest() {
 	)
 	s.mockPriorityAssigner = NewMockPriorityAssigner(s.controller)
 
+	s.timeSource = clock.NewRealTimeSource()
 	s.metricsClient = metrics.NewClient(tally.NoopScope, metrics.History)
 	s.logger = testlogger.New(s.Suite.T())
 
@@ -104,9 +107,11 @@ func (s *queueTaskProcessorSuite) TestGetOrCreateShardTaskScheduler_ProcessorNot
 
 func (s *queueTaskProcessorSuite) TestGetOrCreateShardTaskScheduler_ShardProcessorAlreadyExists() {
 	mockScheduler := task.NewMockScheduler(s.controller)
+	mockScheduler.EXPECT().Stop().Times(1)
 	s.processor.shardSchedulers[s.mockShard] = mockScheduler
 
 	s.processor.Start()
+	defer s.processor.Stop()
 	scheduler, err := s.processor.getOrCreateShardTaskScheduler(s.mockShard)
 	s.NoError(err)
 	s.Equal(mockScheduler, scheduler)
@@ -116,6 +121,7 @@ func (s *queueTaskProcessorSuite) TestGetOrCreateShardTaskScheduler_ShardProcess
 	s.Empty(s.processor.shardSchedulers)
 
 	s.processor.Start()
+	defer s.processor.Stop()
 	scheduler, err := s.processor.getOrCreateShardTaskScheduler(s.mockShard)
 	s.NoError(err)
 
@@ -207,7 +213,7 @@ func (s *queueTaskProcessorSuite) TestTrySubmit_Fail() {
 }
 
 func (s *queueTaskProcessorSuite) TestNewSchedulerOptions_UnknownSchedulerType() {
-	options, err := task.NewSchedulerOptions(0, 100, dynamicconfig.GetIntPropertyFn(10), 1, nil)
+	options, err := task.NewSchedulerOptions[int](0, 100, dynamicconfig.GetIntPropertyFn(10), 1, func(task.PriorityTask) int { return 1 }, func(int) int { return 1 })
 	s.Error(err)
 	s.Nil(options)
 }
@@ -220,6 +226,7 @@ func (s *queueTaskProcessorSuite) newTestQueueTaskProcessor() *processorImpl {
 		config,
 		s.logger,
 		s.metricsClient,
+		s.timeSource,
 	)
 	s.NoError(err)
 	return processor.(*processorImpl)

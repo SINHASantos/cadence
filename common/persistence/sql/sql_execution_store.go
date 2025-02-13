@@ -35,7 +35,6 @@ import (
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/collection"
 	"github.com/uber/cadence/common/log"
-	"github.com/uber/cadence/common/log/tag"
 	p "github.com/uber/cadence/common/persistence"
 	"github.com/uber/cadence/common/persistence/serialization"
 	"github.com/uber/cadence/common/persistence/sql/sqlplugin"
@@ -49,7 +48,15 @@ const (
 
 type sqlExecutionStore struct {
 	sqlStore
-	shardID int
+	shardID                                int
+	txExecuteShardLockedFn                 func(context.Context, int, string, int64, func(sqlplugin.Tx) error) error
+	lockCurrentExecutionIfExistsFn         func(context.Context, sqlplugin.Tx, int, serialization.UUID, string) (*sqlplugin.CurrentExecutionsRow, error)
+	createOrUpdateCurrentExecutionFn       func(context.Context, sqlplugin.Tx, p.CreateWorkflowMode, int, serialization.UUID, string, serialization.UUID, int, int, string, int64, int64) error
+	assertNotCurrentExecutionFn            func(context.Context, sqlplugin.Tx, int, serialization.UUID, string, serialization.UUID) error
+	assertRunIDAndUpdateCurrentExecutionFn func(context.Context, sqlplugin.Tx, int, serialization.UUID, string, serialization.UUID, serialization.UUID, string, int, int, int64, int64) error
+	applyWorkflowSnapshotTxAsNewFn         func(context.Context, sqlplugin.Tx, int, *p.InternalWorkflowSnapshot, serialization.Parser) error
+	applyWorkflowMutationTxFn              func(context.Context, sqlplugin.Tx, int, *p.InternalWorkflowMutation, serialization.Parser) error
+	applyWorkflowSnapshotTxAsResetFn       func(context.Context, sqlplugin.Tx, int, *p.InternalWorkflowSnapshot, serialization.Parser) error
 }
 
 var _ p.ExecutionStore = (*sqlExecutionStore)(nil)
@@ -63,15 +70,24 @@ func NewSQLExecutionStore(
 	dc *p.DynamicConfiguration,
 ) (p.ExecutionStore, error) {
 
-	return &sqlExecutionStore{
-		shardID: shardID,
+	store := &sqlExecutionStore{
+		shardID:                                shardID,
+		lockCurrentExecutionIfExistsFn:         lockCurrentExecutionIfExists,
+		createOrUpdateCurrentExecutionFn:       createOrUpdateCurrentExecution,
+		assertNotCurrentExecutionFn:            assertNotCurrentExecution,
+		assertRunIDAndUpdateCurrentExecutionFn: assertRunIDAndUpdateCurrentExecution,
+		applyWorkflowSnapshotTxAsNewFn:         applyWorkflowSnapshotTxAsNew,
+		applyWorkflowMutationTxFn:              applyWorkflowMutationTx,
+		applyWorkflowSnapshotTxAsResetFn:       applyWorkflowSnapshotTxAsReset,
 		sqlStore: sqlStore{
 			db:     db,
 			logger: logger,
 			parser: parser,
 			dc:     dc,
 		},
-	}, nil
+	}
+	store.txExecuteShardLockedFn = store.txExecuteShardLocked
+	return store, nil
 }
 
 // txExecuteShardLocked executes f under transaction and with read lock on shard row
@@ -105,7 +121,7 @@ func (m *sqlExecutionStore) CreateWorkflowExecution(
 ) (response *p.CreateWorkflowExecutionResponse, err error) {
 	dbShardID := sqlplugin.GetDBShardIDFromHistoryShardID(m.shardID, m.db.GetTotalNumDBShards())
 
-	err = m.txExecuteShardLocked(ctx, dbShardID, "CreateWorkflowExecution", request.RangeID, func(tx sqlplugin.Tx) error {
+	err = m.txExecuteShardLockedFn(ctx, dbShardID, "CreateWorkflowExecution", request.RangeID, func(tx sqlplugin.Tx) error {
 		response, err = m.createWorkflowExecutionTx(ctx, tx, request)
 		return err
 	})
@@ -136,7 +152,7 @@ func (m *sqlExecutionStore) createWorkflowExecutionTx(
 
 	var err error
 	var row *sqlplugin.CurrentExecutionsRow
-	if row, err = lockCurrentExecutionIfExists(ctx, tx, m.shardID, domainID, workflowID); err != nil {
+	if row, err = m.lockCurrentExecutionIfExistsFn(ctx, tx, m.shardID, domainID, workflowID); err != nil {
 		return nil, err
 	}
 
@@ -204,7 +220,7 @@ func (m *sqlExecutionStore) createWorkflowExecutionTx(
 		}
 	}
 
-	if err := createOrUpdateCurrentExecution(
+	if err := m.createOrUpdateCurrentExecutionFn(
 		ctx,
 		tx,
 		request.Mode,
@@ -220,7 +236,7 @@ func (m *sqlExecutionStore) createWorkflowExecutionTx(
 		return nil, err
 	}
 
-	if err := applyWorkflowSnapshotTxAsNew(ctx, tx, shardID, &request.NewWorkflowSnapshot, m.parser); err != nil {
+	if err := m.applyWorkflowSnapshotTxAsNewFn(ctx, tx, shardID, &request.NewWorkflowSnapshot, m.parser); err != nil {
 		return nil, err
 	}
 
@@ -291,64 +307,68 @@ func (m *sqlExecutionStore) GetWorkflowExecution(
 	var bufferedEvents []*p.DataBlob
 	var signalsRequested map[string]struct{}
 
-	g, ctx := errgroup.WithContext(ctx)
-
-	g.Go(func() (e error) {
-		defer func() { recoverPanic(recover(), &e) }()
-		executions, e = m.getExecutions(ctx, request, domainID, wfID, runID)
-		return e
-	})
+	g, childCtx := errgroup.WithContext(ctx)
 
 	g.Go(func() (e error) {
 		defer func() { recoverPanic(recover(), &e) }()
 		activityInfos, e = getActivityInfoMap(
-			ctx, m.db, m.shardID, domainID, wfID, runID, m.parser)
+			childCtx, m.db, m.shardID, domainID, wfID, runID, m.parser)
 		return e
 	})
 
 	g.Go(func() (e error) {
 		defer func() { recoverPanic(recover(), &e) }()
 		timerInfos, e = getTimerInfoMap(
-			ctx, m.db, m.shardID, domainID, wfID, runID, m.parser)
+			childCtx, m.db, m.shardID, domainID, wfID, runID, m.parser)
 		return e
 	})
 
 	g.Go(func() (e error) {
 		defer func() { recoverPanic(recover(), &e) }()
 		childExecutionInfos, e = getChildExecutionInfoMap(
-			ctx, m.db, m.shardID, domainID, wfID, runID, m.parser)
+			childCtx, m.db, m.shardID, domainID, wfID, runID, m.parser)
 		return e
 	})
 
 	g.Go(func() (e error) {
 		defer func() { recoverPanic(recover(), &e) }()
 		requestCancelInfos, e = getRequestCancelInfoMap(
-			ctx, m.db, m.shardID, domainID, wfID, runID, m.parser)
+			childCtx, m.db, m.shardID, domainID, wfID, runID, m.parser)
 		return e
 	})
 
 	g.Go(func() (e error) {
 		defer func() { recoverPanic(recover(), &e) }()
 		signalInfos, e = getSignalInfoMap(
-			ctx, m.db, m.shardID, domainID, wfID, runID, m.parser)
+			childCtx, m.db, m.shardID, domainID, wfID, runID, m.parser)
 		return e
 	})
 
 	g.Go(func() (e error) {
 		defer func() { recoverPanic(recover(), &e) }()
 		bufferedEvents, e = getBufferedEvents(
-			ctx, m.db, m.shardID, domainID, wfID, runID)
+			childCtx, m.db, m.shardID, domainID, wfID, runID)
 		return e
 	})
 
 	g.Go(func() (e error) {
 		defer func() { recoverPanic(recover(), &e) }()
 		signalsRequested, e = getSignalsRequested(
-			ctx, m.db, m.shardID, domainID, wfID, runID)
+			childCtx, m.db, m.shardID, domainID, wfID, runID)
 		return e
 	})
 
 	err := g.Wait()
+	if err != nil {
+		return nil, err
+	}
+
+	// there is a race condition with delete workflow. What could happen is that
+	// a delete workflow transaction can be committed between 2 concurrent read operations
+	// and in that case we can get checksum error because data is partially read.
+	// Since checksum is stored in the executions table, we make it the last step of reading,
+	// in this case, either we read full data with checksum or we don't get checksum and return error.
+	executions, err = m.getExecutions(ctx, request, domainID, wfID, runID)
 	if err != nil {
 		return nil, err
 	}
@@ -359,6 +379,23 @@ func (m *sqlExecutionStore) GetWorkflowExecution(
 			Message: fmt.Sprintf("GetWorkflowExecution: failed. Error: %v", err),
 		}
 	}
+	// if we have checksum, we need to make sure the rangeID did not change
+	// if the rangeID changed, it means the shard ownership might have changed
+	// and the workflow might have been updated when we read the data, so the data
+	// we read might not be from a consistent view, the checksum validation might fail
+	// in that case, we clear the checksum data so that we will not perform the validation
+	if state.ChecksumData != nil {
+		row, err := m.db.SelectFromShards(ctx, &sqlplugin.ShardsFilter{ShardID: int64(m.shardID)})
+		if err != nil {
+			return nil, convertCommonErrors(m.db, "GetWorkflowExecution", "", err)
+		}
+		if row.RangeID != request.RangeID {
+			// The GetWorkflowExecution operation will not be impacted by this. ChecksumData is purely for validation purposes.
+			m.logger.Warn("GetWorkflowExecution's checksum is discarded. The shard might have changed owner.")
+			state.ChecksumData = nil
+		}
+	}
+
 	state.ActivityInfos = activityInfos
 	state.TimerInfos = timerInfos
 	state.ChildExecutionInfos = childExecutionInfos
@@ -375,7 +412,7 @@ func (m *sqlExecutionStore) UpdateWorkflowExecution(
 	request *p.InternalUpdateWorkflowExecutionRequest,
 ) error {
 	dbShardID := sqlplugin.GetDBShardIDFromHistoryShardID(m.shardID, m.db.GetTotalNumDBShards())
-	return m.txExecuteShardLocked(ctx, dbShardID, "UpdateWorkflowExecution", request.RangeID, func(tx sqlplugin.Tx) error {
+	return m.txExecuteShardLockedFn(ctx, dbShardID, "UpdateWorkflowExecution", request.RangeID, func(tx sqlplugin.Tx) error {
 		return m.updateWorkflowExecutionTx(ctx, tx, request)
 	})
 }
@@ -407,7 +444,7 @@ func (m *sqlExecutionStore) updateWorkflowExecutionTx(
 	case p.UpdateWorkflowModeIgnoreCurrent:
 		// no-op
 	case p.UpdateWorkflowModeBypassCurrent:
-		if err := assertNotCurrentExecution(
+		if err := m.assertNotCurrentExecutionFn(
 			ctx,
 			tx,
 			shardID,
@@ -431,7 +468,7 @@ func (m *sqlExecutionStore) updateWorkflowExecutionTx(
 				}
 			}
 
-			if err := assertRunIDAndUpdateCurrentExecution(
+			if err := m.assertRunIDAndUpdateCurrentExecutionFn(
 				ctx,
 				tx,
 				shardID,
@@ -450,7 +487,7 @@ func (m *sqlExecutionStore) updateWorkflowExecutionTx(
 			startVersion := updateWorkflow.StartVersion
 			lastWriteVersion := updateWorkflow.LastWriteVersion
 			// this is only to update the current record
-			if err := assertRunIDAndUpdateCurrentExecution(
+			if err := m.assertRunIDAndUpdateCurrentExecutionFn(
 				ctx,
 				tx,
 				shardID,
@@ -473,24 +510,11 @@ func (m *sqlExecutionStore) updateWorkflowExecutionTx(
 		}
 	}
 
-	if m.useAsyncTransaction() { // async transaction is enabled
-		// TODO: it's possible to merge some operations in the following 2 functions in a batch, should refactor the code later
-		if err := applyWorkflowMutationAsyncTx(ctx, tx, shardID, &updateWorkflow, m.parser); err != nil {
-			return err
-		}
-		if newWorkflow != nil {
-			if err := m.applyWorkflowSnapshotAsyncTxAsNew(ctx, tx, shardID, newWorkflow, m.parser); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-
-	if err := applyWorkflowMutationTx(ctx, tx, shardID, &updateWorkflow, m.parser); err != nil {
+	if err := m.applyWorkflowMutationTxFn(ctx, tx, shardID, &updateWorkflow, m.parser); err != nil {
 		return err
 	}
 	if newWorkflow != nil {
-		if err := applyWorkflowSnapshotTxAsNew(ctx, tx, shardID, newWorkflow, m.parser); err != nil {
+		if err := m.applyWorkflowSnapshotTxAsNewFn(ctx, tx, shardID, newWorkflow, m.parser); err != nil {
 			return err
 		}
 	}
@@ -502,7 +526,7 @@ func (m *sqlExecutionStore) ConflictResolveWorkflowExecution(
 	request *p.InternalConflictResolveWorkflowExecutionRequest,
 ) error {
 	dbShardID := sqlplugin.GetDBShardIDFromHistoryShardID(m.shardID, m.db.GetTotalNumDBShards())
-	return m.txExecuteShardLocked(ctx, dbShardID, "ConflictResolveWorkflowExecution", request.RangeID, func(tx sqlplugin.Tx) error {
+	return m.txExecuteShardLockedFn(ctx, dbShardID, "ConflictResolveWorkflowExecution", request.RangeID, func(tx sqlplugin.Tx) error {
 		return m.conflictResolveWorkflowExecutionTx(ctx, tx, request)
 	})
 }
@@ -533,7 +557,7 @@ func (m *sqlExecutionStore) conflictResolveWorkflowExecutionTx(
 
 	switch request.Mode {
 	case p.ConflictResolveWorkflowModeBypassCurrent:
-		if err := assertNotCurrentExecution(
+		if err := m.assertNotCurrentExecutionFn(
 			ctx,
 			tx,
 			shardID,
@@ -560,7 +584,7 @@ func (m *sqlExecutionStore) conflictResolveWorkflowExecutionTx(
 		if currentWorkflow != nil {
 			prevRunID := serialization.MustParseUUID(currentWorkflow.ExecutionInfo.RunID)
 
-			if err := assertRunIDAndUpdateCurrentExecution(
+			if err := m.assertRunIDAndUpdateCurrentExecutionFn(
 				ctx,
 				tx,
 				m.shardID,
@@ -579,7 +603,7 @@ func (m *sqlExecutionStore) conflictResolveWorkflowExecutionTx(
 			// reset workflow is current
 			prevRunID := serialization.MustParseUUID(resetWorkflow.ExecutionInfo.RunID)
 
-			if err := assertRunIDAndUpdateCurrentExecution(
+			if err := m.assertRunIDAndUpdateCurrentExecutionFn(
 				ctx,
 				tx,
 				m.shardID,
@@ -602,16 +626,16 @@ func (m *sqlExecutionStore) conflictResolveWorkflowExecutionTx(
 		}
 	}
 
-	if err := applyWorkflowSnapshotTxAsReset(ctx, tx, shardID, &resetWorkflow, m.parser); err != nil {
+	if err := m.applyWorkflowSnapshotTxAsResetFn(ctx, tx, shardID, &resetWorkflow, m.parser); err != nil {
 		return err
 	}
 	if currentWorkflow != nil {
-		if err := applyWorkflowMutationTx(ctx, tx, shardID, currentWorkflow, m.parser); err != nil {
+		if err := m.applyWorkflowMutationTxFn(ctx, tx, shardID, currentWorkflow, m.parser); err != nil {
 			return err
 		}
 	}
 	if newWorkflow != nil {
-		if err := applyWorkflowSnapshotTxAsNew(ctx, tx, shardID, newWorkflow, m.parser); err != nil {
+		if err := m.applyWorkflowSnapshotTxAsNewFn(ctx, tx, shardID, newWorkflow, m.parser); err != nil {
 			return err
 		}
 	}
@@ -622,104 +646,77 @@ func (m *sqlExecutionStore) DeleteWorkflowExecution(
 	ctx context.Context,
 	request *p.DeleteWorkflowExecutionRequest,
 ) error {
-	recoverPanic := func(recovered interface{}, err *error) {
-		if recovered != nil {
-			*err = fmt.Errorf("DB operation panicked: %v %s", recovered, debug.Stack())
-		}
-	}
+	dbShardID := sqlplugin.GetDBShardIDFromHistoryShardID(m.shardID, m.db.GetTotalNumDBShards())
 	domainID := serialization.MustParseUUID(request.DomainID)
 	runID := serialization.MustParseUUID(request.RunID)
 	wfID := request.WorkflowID
-	g, ctx := errgroup.WithContext(ctx)
-
-	g.Go(func() (e error) {
-		defer func() { recoverPanic(recover(), &e) }()
-		_, e = m.db.DeleteFromExecutions(ctx, &sqlplugin.ExecutionsFilter{
+	return m.txExecute(ctx, dbShardID, "DeleteWorkflowExecution", func(tx sqlplugin.Tx) error {
+		if _, err := tx.DeleteFromExecutions(ctx, &sqlplugin.ExecutionsFilter{
 			ShardID:    m.shardID,
 			DomainID:   domainID,
 			WorkflowID: wfID,
 			RunID:      runID,
-		})
-		return e
-	})
-
-	g.Go(func() (e error) {
-		defer func() { recoverPanic(recover(), &e) }()
-		_, e = m.db.DeleteFromActivityInfoMaps(ctx, &sqlplugin.ActivityInfoMapsFilter{
+		}); err != nil {
+			return convertCommonErrors(tx, "DeleteWorkflowExecution", "", err)
+		}
+		if _, err := tx.DeleteFromActivityInfoMaps(ctx, &sqlplugin.ActivityInfoMapsFilter{
 			ShardID:    int64(m.shardID),
 			DomainID:   domainID,
 			WorkflowID: wfID,
 			RunID:      runID,
-		})
-		return e
-	})
-
-	g.Go(func() (e error) {
-		defer func() { recoverPanic(recover(), &e) }()
-		_, e = m.db.DeleteFromTimerInfoMaps(ctx, &sqlplugin.TimerInfoMapsFilter{
+		}); err != nil {
+			return convertCommonErrors(tx, "DeleteFromActivityInfoMaps", "", err)
+		}
+		if _, err := tx.DeleteFromTimerInfoMaps(ctx, &sqlplugin.TimerInfoMapsFilter{
 			ShardID:    int64(m.shardID),
 			DomainID:   domainID,
 			WorkflowID: wfID,
 			RunID:      runID,
-		})
-		return e
-	})
-
-	g.Go(func() (e error) {
-		defer func() { recoverPanic(recover(), &e) }()
-		_, e = m.db.DeleteFromChildExecutionInfoMaps(ctx, &sqlplugin.ChildExecutionInfoMapsFilter{
+		}); err != nil {
+			return convertCommonErrors(tx, "DeleteFromTimerInfoMaps", "", err)
+		}
+		if _, err := tx.DeleteFromChildExecutionInfoMaps(ctx, &sqlplugin.ChildExecutionInfoMapsFilter{
 			ShardID:    int64(m.shardID),
 			DomainID:   domainID,
 			WorkflowID: wfID,
 			RunID:      runID,
-		})
-		return e
-	})
-
-	g.Go(func() (e error) {
-		defer func() { recoverPanic(recover(), &e) }()
-		_, e = m.db.DeleteFromRequestCancelInfoMaps(ctx, &sqlplugin.RequestCancelInfoMapsFilter{
+		}); err != nil {
+			return convertCommonErrors(tx, "DeleteFromChildExecutionInfoMaps", "", err)
+		}
+		if _, err := tx.DeleteFromRequestCancelInfoMaps(ctx, &sqlplugin.RequestCancelInfoMapsFilter{
 			ShardID:    int64(m.shardID),
 			DomainID:   domainID,
 			WorkflowID: wfID,
 			RunID:      runID,
-		})
-		return e
-	})
-
-	g.Go(func() (e error) {
-		defer func() { recoverPanic(recover(), &e) }()
-		_, e = m.db.DeleteFromSignalInfoMaps(ctx, &sqlplugin.SignalInfoMapsFilter{
+		}); err != nil {
+			return convertCommonErrors(tx, "DeleteFromRequestCancelInfoMaps", "", err)
+		}
+		if _, err := tx.DeleteFromSignalInfoMaps(ctx, &sqlplugin.SignalInfoMapsFilter{
 			ShardID:    int64(m.shardID),
 			DomainID:   domainID,
 			WorkflowID: wfID,
 			RunID:      runID,
-		})
-		return e
-	})
-
-	g.Go(func() (e error) {
-		defer func() { recoverPanic(recover(), &e) }()
-		_, e = m.db.DeleteFromBufferedEvents(ctx, &sqlplugin.BufferedEventsFilter{
+		}); err != nil {
+			return convertCommonErrors(tx, "DeleteFromSignalInfoMaps", "", err)
+		}
+		if _, err := tx.DeleteFromBufferedEvents(ctx, &sqlplugin.BufferedEventsFilter{
 			ShardID:    m.shardID,
 			DomainID:   domainID,
 			WorkflowID: wfID,
 			RunID:      runID,
-		})
-		return e
-	})
-
-	g.Go(func() (e error) {
-		defer func() { recoverPanic(recover(), &e) }()
-		_, e = m.db.DeleteFromSignalsRequestedSets(ctx, &sqlplugin.SignalsRequestedSetsFilter{
+		}); err != nil {
+			return convertCommonErrors(tx, "DeleteFromBufferedEvents", "", err)
+		}
+		if _, err := tx.DeleteFromSignalsRequestedSets(ctx, &sqlplugin.SignalsRequestedSetsFilter{
 			ShardID:    int64(m.shardID),
 			DomainID:   domainID,
 			WorkflowID: wfID,
 			RunID:      runID,
-		})
-		return e
+		}); err != nil {
+			return convertCommonErrors(tx, "DeleteFromSignalsRequestedSets", "", err)
+		}
+		return nil
 	})
-	return g.Wait()
 }
 
 // its possible for a new run of the same workflow to have started after the run we are deleting
@@ -1237,25 +1234,42 @@ func (m *sqlExecutionStore) CreateFailoverMarkerTasks(
 	request *p.CreateFailoverMarkersRequest,
 ) error {
 	dbShardID := sqlplugin.GetDBShardIDFromHistoryShardID(m.shardID, m.db.GetTotalNumDBShards())
-	return m.txExecuteShardLocked(ctx, dbShardID, "CreateFailoverMarkerTasks", request.RangeID, func(tx sqlplugin.Tx) error {
-		for _, task := range request.Markers {
-			t := []p.Task{task}
-			if err := createReplicationTasks(
-				ctx,
-				tx,
-				t,
-				m.shardID,
-				serialization.MustParseUUID(task.DomainID),
-				emptyWorkflowID,
-				serialization.MustParseUUID(emptyReplicationRunID),
-				m.parser,
-			); err != nil {
-				rollBackErr := tx.Rollback()
-				if rollBackErr != nil {
-					m.logger.Error("transaction rollback error", tag.Error(rollBackErr))
-				}
+	return m.txExecuteShardLockedFn(ctx, dbShardID, "CreateFailoverMarkerTasks", request.RangeID, func(tx sqlplugin.Tx) error {
+		replicationTasksRows := make([]sqlplugin.ReplicationTasksRow, len(request.Markers))
+		for i, task := range request.Markers {
+			blob, err := m.parser.ReplicationTaskInfoToBlob(&serialization.ReplicationTaskInfo{
+				DomainID:                serialization.MustParseUUID(task.DomainID),
+				WorkflowID:              emptyWorkflowID,
+				RunID:                   serialization.MustParseUUID(emptyReplicationRunID),
+				TaskType:                int16(task.GetType()),
+				FirstEventID:            common.EmptyEventID,
+				NextEventID:             common.EmptyEventID,
+				Version:                 task.GetVersion(),
+				ScheduledID:             common.EmptyEventID,
+				EventStoreVersion:       p.EventStoreVersion,
+				NewRunEventStoreVersion: p.EventStoreVersion,
+				BranchToken:             nil,
+				NewRunBranchToken:       nil,
+				CreationTimestamp:       task.GetVisibilityTimestamp(),
+			})
+			if err != nil {
 				return err
 			}
+			replicationTasksRows[i].ShardID = m.shardID
+			replicationTasksRows[i].TaskID = task.GetTaskID()
+			replicationTasksRows[i].Data = blob.Data
+			replicationTasksRows[i].DataEncoding = string(blob.Encoding)
+		}
+		result, err := tx.InsertIntoReplicationTasks(ctx, replicationTasksRows)
+		if err != nil {
+			return convertCommonErrors(tx, "CreateFailoverMarkerTasks", "", err)
+		}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return &types.InternalServiceError{Message: fmt.Sprintf("CreateFailoverMarkerTasks failed. Could not verify number of rows inserted. Error: %v", err)}
+		}
+		if int(rowsAffected) != len(replicationTasksRows) {
+			return &types.InternalServiceError{Message: fmt.Sprintf("CreateFailoverMarkerTasks failed. Inserted %v instead of %v rows into replication_tasks.", rowsAffected, len(replicationTasksRows))}
 		}
 		return nil
 	})

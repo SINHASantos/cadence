@@ -25,6 +25,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
+	matchingv1 "github.com/uber/cadence/.gen/proto/matching/v1"
 	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/common/types/testdata"
 )
@@ -38,6 +39,18 @@ func TestMatchingAddActivityTaskRequest(t *testing.T) {
 func TestMatchingAddDecisionTaskRequest(t *testing.T) {
 	for _, item := range []*types.AddDecisionTaskRequest{nil, {}, &testdata.MatchingAddDecisionTaskRequest} {
 		assert.Equal(t, item, ToMatchingAddDecisionTaskRequest(FromMatchingAddDecisionTaskRequest(item)))
+	}
+}
+
+func TestMatchingAddActivityTaskResponse(t *testing.T) {
+	for _, item := range []*types.AddActivityTaskResponse{nil, {}, &testdata.MatchingAddActivityTaskResponse} {
+		assert.Equal(t, item, ToMatchingAddActivityTaskResponse(FromMatchingAddActivityTaskResponse(item)))
+	}
+}
+
+func TestMatchingAddDecisionTaskResponse(t *testing.T) {
+	for _, item := range []*types.AddDecisionTaskResponse{nil, {}, &testdata.MatchingAddDecisionTaskResponse} {
+		assert.Equal(t, item, ToMatchingAddDecisionTaskResponse(FromMatchingAddDecisionTaskResponse(item)))
 	}
 }
 
@@ -84,8 +97,14 @@ func TestMatchingPollForActivityTaskRequest(t *testing.T) {
 }
 
 func TestMatchingPollForActivityTaskResponse(t *testing.T) {
-	for _, item := range []*types.PollForActivityTaskResponse{nil, {}, &testdata.MatchingPollForActivityTaskResponse} {
+	for _, item := range []*types.MatchingPollForActivityTaskResponse{nil, {}, &testdata.MatchingPollForActivityTaskResponse} {
 		assert.Equal(t, item, ToMatchingPollForActivityTaskResponse(FromMatchingPollForActivityTaskResponse(item)))
+	}
+}
+
+func TestTaskListPartitionConfig(t *testing.T) {
+	for _, item := range []*types.TaskListPartitionConfig{nil, {}, &testdata.TaskListPartitionConfig} {
+		assert.Equal(t, item, ToTaskListPartitionConfig(FromTaskListPartitionConfig(item)))
 	}
 }
 
@@ -128,5 +147,116 @@ func TestMatchingGetTaskListsByDomainRequest(t *testing.T) {
 func TestMatchingGetTaskListsByDomainResponse(t *testing.T) {
 	for _, item := range []*types.GetTaskListsByDomainResponse{nil, {}, &testdata.GetTaskListsByDomainResponse} {
 		assert.Equal(t, item, ToMatchingGetTaskListsByDomainResponse(FromMatchingGetTaskListsByDomainResponse(item)))
+	}
+}
+
+func TestMatchingUpdateTaskListPartitionConfigRequest(t *testing.T) {
+	for _, item := range []*types.MatchingUpdateTaskListPartitionConfigRequest{nil, {}, &testdata.MatchingUpdateTaskListPartitionConfigRequest} {
+		assert.Equal(t, item, ToMatchingUpdateTaskListPartitionConfigRequest(FromMatchingUpdateTaskListPartitionConfigRequest(item)))
+	}
+}
+
+func TestMatchingUpdateTaskListPartitionConfigResponse(t *testing.T) {
+	for _, item := range []*types.MatchingUpdateTaskListPartitionConfigResponse{nil, {}} {
+		assert.Equal(t, item, ToMatchingUpdateTaskListPartitionConfigResponse(FromMatchingUpdateTaskListPartitionConfigResponse(item)))
+	}
+}
+
+func TestMatchingRefreshTaskListPartitionConfigRequest(t *testing.T) {
+	for _, item := range []*types.MatchingRefreshTaskListPartitionConfigRequest{nil, {}, &testdata.MatchingRefreshTaskListPartitionConfigRequest} {
+		assert.Equal(t, item, ToMatchingRefreshTaskListPartitionConfigRequest(FromMatchingRefreshTaskListPartitionConfigRequest(item)))
+	}
+}
+
+func TestMatchingRefreshTaskListPartitionConfigResponse(t *testing.T) {
+	for _, item := range []*types.MatchingRefreshTaskListPartitionConfigResponse{nil, {}} {
+		assert.Equal(t, item, ToMatchingRefreshTaskListPartitionConfigResponse(FromMatchingRefreshTaskListPartitionConfigResponse(item)))
+	}
+}
+
+func TestToMatchingTaskListPartitionConfig(t *testing.T) {
+	cases := []struct {
+		name     string
+		config   *matchingv1.TaskListPartitionConfig
+		expected *types.TaskListPartitionConfig
+	}{
+		{
+			name: "happy path",
+			config: &matchingv1.TaskListPartitionConfig{
+				Version:            1,
+				NumReadPartitions:  2,
+				NumWritePartitions: 2,
+				ReadPartitions: map[int32]*matchingv1.TaskListPartition{
+					0: {IsolationGroups: []string{"foo"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+				WritePartitions: map[int32]*matchingv1.TaskListPartition{
+					0: {IsolationGroups: []string{"baz"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+			},
+			expected: &types.TaskListPartitionConfig{
+				Version: 1,
+				ReadPartitions: map[int]*types.TaskListPartition{
+					0: {IsolationGroups: []string{"foo"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+				WritePartitions: map[int]*types.TaskListPartition{
+					0: {IsolationGroups: []string{"baz"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+			},
+		},
+		{
+			name: "numbers only",
+			config: &matchingv1.TaskListPartitionConfig{
+				Version:            1,
+				NumReadPartitions:  2,
+				NumWritePartitions: 2,
+			},
+			expected: &types.TaskListPartitionConfig{
+				Version: 1,
+				ReadPartitions: map[int]*types.TaskListPartition{
+					0: {},
+					1: {},
+				},
+				WritePartitions: map[int]*types.TaskListPartition{
+					0: {},
+					1: {},
+				},
+			},
+		},
+		{
+			name: "number mismatch",
+			config: &matchingv1.TaskListPartitionConfig{
+				Version:            1,
+				NumReadPartitions:  2,
+				NumWritePartitions: 1,
+				ReadPartitions: map[int32]*matchingv1.TaskListPartition{
+					0: {IsolationGroups: []string{"foo"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+				WritePartitions: map[int32]*matchingv1.TaskListPartition{
+					0: {IsolationGroups: []string{"baz"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+			},
+			expected: &types.TaskListPartitionConfig{
+				Version: 1,
+				ReadPartitions: map[int]*types.TaskListPartition{
+					0: {IsolationGroups: []string{"foo"}},
+					1: {IsolationGroups: []string{"bar"}},
+				},
+				WritePartitions: map[int]*types.TaskListPartition{
+					0: {},
+				},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := ToTaskListPartitionConfig(tc.config)
+			assert.Equal(t, tc.expected, actual)
+		})
 	}
 }

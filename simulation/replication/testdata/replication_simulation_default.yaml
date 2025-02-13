@@ -1,0 +1,32 @@
+# This file is a replication simulation scenario spec.
+# It is parsed into ReplicationSimulationConfig struct.
+# Replication simulations can be run via ./simulation/replication/run.sh
+clusters:
+  cluster0:
+    grpcEndpoint: "cadence-cluster0:7833"
+  cluster1:
+    grpcEndpoint: "cadence-cluster1:7833"
+
+# primaryCluster is where domain data is written to and replicates to others. e.g. domain registration
+primaryCluster: "cluster0"
+
+operations:
+  - op: start_workflow
+    at: 0s
+    workflowID: wf1
+    cluster: cluster0
+    workflowDuration: 35s
+
+  - op: failover # failover from cluster0 to cluster1
+    at: 20s
+    newActiveCluster: cluster1
+    # failoverTimeoutSec: 5 # unset means force failover. setting it means graceful failover request
+
+  - op: validate
+    at: 120s # todo: this should work at 40s mark
+    workflowID: wf1
+    cluster: cluster1
+    want:
+      status: completed
+      startedByWorkersInCluster: cluster0
+      completedByWorkersInCluster: cluster1

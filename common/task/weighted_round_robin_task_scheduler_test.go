@@ -28,13 +28,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	"github.com/uber-go/tally"
+	"go.uber.org/mock/gomock"
 
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/backoff"
+	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/dynamicconfig"
 	"github.com/uber/cadence/common/log/testlogger"
 	"github.com/uber/cadence/common/metrics"
@@ -50,7 +51,7 @@ type (
 
 		queueSize int
 
-		scheduler *weightedRoundRobinTaskSchedulerImpl
+		scheduler *weightedRoundRobinTaskSchedulerImpl[int]
 	}
 
 	mockPriorityTaskMatcher struct {
@@ -81,12 +82,17 @@ func (s *weightedRoundRobinTaskSchedulerSuite) SetupTest() {
 
 	s.queueSize = 1000
 	s.scheduler = s.newTestWeightedRoundRobinTaskScheduler(
-		&WeightedRoundRobinTaskSchedulerOptions{
-			Weights:         testSchedulerWeights,
+		&WeightedRoundRobinTaskSchedulerOptions[int]{
 			QueueSize:       s.queueSize,
 			WorkerCount:     dynamicconfig.GetIntPropertyFn(1),
 			DispatcherCount: 3,
 			RetryPolicy:     backoff.NewExponentialRetryPolicy(time.Millisecond),
+			TaskToChannelKeyFn: func(task PriorityTask) int {
+				return task.Priority()
+			},
+			ChannelKeyToWeightFn: func(key int) int {
+				return testSchedulerWeights()[fmt.Sprintf("%v", key)].(int)
+			},
 		},
 	)
 }
@@ -103,9 +109,13 @@ func (s *weightedRoundRobinTaskSchedulerSuite) TestSubmit_Success() {
 	err := s.scheduler.Submit(mockTask)
 	s.NoError(err)
 
-	task := <-s.scheduler.taskChs[taskPriority]
+	weight := s.scheduler.options.ChannelKeyToWeightFn(taskPriority)
+	taskCh, releaseFn := s.scheduler.pool.GetOrCreateChannel(taskPriority, weight)
+	defer releaseFn()
+	task := <-taskCh
 	s.Equal(mockTask, task)
-	for _, taskCh := range s.scheduler.taskChs {
+	taskChs := s.scheduler.pool.GetAllChannels()
+	for _, taskCh := range taskChs {
 		s.Empty(taskCh)
 	}
 }
@@ -113,8 +123,7 @@ func (s *weightedRoundRobinTaskSchedulerSuite) TestSubmit_Success() {
 func (s *weightedRoundRobinTaskSchedulerSuite) TestSubmit_Fail_SchedulerShutDown() {
 	// create a new scheduler here with queue size 0, otherwise test is non-deterministic
 	scheduler := s.newTestWeightedRoundRobinTaskScheduler(
-		&WeightedRoundRobinTaskSchedulerOptions{
-			Weights:         testSchedulerWeights,
+		&WeightedRoundRobinTaskSchedulerOptions[int]{
 			QueueSize:       0,
 			WorkerCount:     dynamicconfig.GetIntPropertyFn(1),
 			DispatcherCount: 3,
@@ -127,15 +136,6 @@ func (s *weightedRoundRobinTaskSchedulerSuite) TestSubmit_Fail_SchedulerShutDown
 	scheduler.Stop()
 	err := scheduler.Submit(mockTask)
 	s.Equal(ErrTaskSchedulerClosed, err)
-}
-
-func (s *weightedRoundRobinTaskSchedulerSuite) TestSubmit_Fail_UnknownPriority() {
-	taskPriority := 5 // make sure the number is not in testSchedulerWeights
-	mockTask := NewMockPriorityTask(s.controller)
-	mockTask.EXPECT().Priority().Return(taskPriority)
-	err := s.scheduler.Submit(mockTask)
-	s.Error(err)
-	s.NotEqual(ErrTaskSchedulerClosed, err)
 }
 
 func (s *weightedRoundRobinTaskSchedulerSuite) TestTrySubmit() {
@@ -182,7 +182,9 @@ func (s *weightedRoundRobinTaskSchedulerSuite) TestDispatcher_SubmitWithNoError(
 				if expectedRemainingTasksNum < 0 {
 					expectedRemainingTasksNum = 0
 				}
-				s.Equal(expectedRemainingTasksNum, len(s.scheduler.taskChs[priority]))
+				taskCh, releaseFn := s.scheduler.pool.GetOrCreateChannel(priority, weight)
+				s.Equal(expectedRemainingTasksNum, len(taskCh))
+				releaseFn()
 			}
 		}
 
@@ -285,15 +287,16 @@ func (s *weightedRoundRobinTaskSchedulerSuite) TestSchedulerContract() {
 }
 
 func (s *weightedRoundRobinTaskSchedulerSuite) newTestWeightedRoundRobinTaskScheduler(
-	options *WeightedRoundRobinTaskSchedulerOptions,
-) *weightedRoundRobinTaskSchedulerImpl {
+	options *WeightedRoundRobinTaskSchedulerOptions[int],
+) *weightedRoundRobinTaskSchedulerImpl[int] {
 	scheduler, err := NewWeightedRoundRobinTaskScheduler(
 		testlogger.New(s.Suite.T()),
 		metrics.NewClient(tally.NoopScope, metrics.Common),
+		clock.NewMockedTimeSource(),
 		options,
 	)
 	s.NoError(err)
-	return scheduler.(*weightedRoundRobinTaskSchedulerImpl)
+	return scheduler.(*weightedRoundRobinTaskSchedulerImpl[int])
 }
 
 func testSchedulerContract(
@@ -359,7 +362,7 @@ func testSchedulerContract(
 	switch schedulerImpl := scheduler.(type) {
 	case *fifoTaskSchedulerImpl:
 		<-schedulerImpl.shutdownCh
-	case *weightedRoundRobinTaskSchedulerImpl:
+	case *weightedRoundRobinTaskSchedulerImpl[int]:
 		<-schedulerImpl.shutdownCh
 	default:
 		s.Fail("unknown task scheduler type")

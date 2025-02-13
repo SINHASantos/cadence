@@ -49,10 +49,6 @@ import (
 	"github.com/uber/cadence/common/types/mapper/thrift"
 )
 
-const (
-	esPersistenceName = "elasticsearch"
-)
-
 type (
 	esVisibilityStore struct {
 		esClient es.GenericClient
@@ -85,7 +81,7 @@ func NewElasticSearchVisibilityStore(
 func (v *esVisibilityStore) Close() {}
 
 func (v *esVisibilityStore) GetName() string {
-	return esPersistenceName
+	return common.ESPersistenceName
 }
 
 func (v *esVisibilityStore) RecordWorkflowExecutionStarted(
@@ -503,7 +499,7 @@ const (
 	jsonRangeOnExecutionTime = `{"range":{"ExecutionTime":`
 	jsonSortForOpen          = `[{"StartTime":"desc"},{"RunID":"desc"}]`
 	jsonSortWithTieBreaker   = `{"RunID":"desc"}`
-	jsonMissingStartTime     = `{"missing":{"field":"StartTime"}}` //used to identify uninitialized workflow execution records
+	jsonMissingStartTime     = `{"missing":{"field":"StartTime"}}` // used to identify uninitialized workflow execution records
 
 	dslFieldSort        = "sort"
 	dslFieldSearchAfter = "search_after"
@@ -560,7 +556,11 @@ func getESQueryDSLForCount(request *p.CountWorkflowExecutionsRequest) (string, e
 
 func (v *esVisibilityStore) getESQueryDSL(request *p.ListWorkflowExecutionsByQueryRequest, token *es.ElasticVisibilityPageToken) (string, error) {
 	sql := getSQLFromListRequest(request)
-	dsl, err := getCustomizedDSLFromSQL(sql, request.DomainUUID)
+	return v.processedDSLfromSQL(sql, request.DomainUUID, token)
+}
+
+func (v *esVisibilityStore) processedDSLfromSQL(sql, domainUUID string, token *es.ElasticVisibilityPageToken) (string, error) {
+	dsl, err := getCustomizedDSLFromSQL(sql, domainUUID)
 	if err != nil {
 		return "", err
 	}
