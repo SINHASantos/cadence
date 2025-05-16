@@ -1087,12 +1087,12 @@ func (adh *adminHandlerImpl) ReadDLQMessages(
 
 	var tasks []*types.ReplicationTask
 	var token []byte
-	var op func() error
+	var op func(ctx context.Context) error
 	switch request.GetType() {
 	case types.DLQTypeReplication:
 		return adh.GetHistoryClient().ReadDLQMessages(ctx, request)
 	case types.DLQTypeDomain:
-		op = func() error {
+		op = func(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -1142,12 +1142,12 @@ func (adh *adminHandlerImpl) PurgeDLQMessages(
 		request.InclusiveEndMessageID = common.Ptr(constants.InclusiveEndMessageID)
 	}
 
-	var op func() error
+	var op func(ctx context.Context) error
 	switch request.GetType() {
 	case types.DLQTypeReplication:
 		return adh.GetHistoryClient().PurgeDLQMessages(ctx, request)
 	case types.DLQTypeDomain:
-		op = func() error {
+		op = func(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -1217,13 +1217,13 @@ func (adh *adminHandlerImpl) MergeDLQMessages(
 	}
 
 	var token []byte
-	var op func() error
+	var op func(ctx context.Context) error
 	switch request.GetType() {
 	case types.DLQTypeReplication:
 		return adh.GetHistoryClient().MergeDLQMessages(ctx, request)
 	case types.DLQTypeDomain:
 
-		op = func() error {
+		op = func(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -1293,13 +1293,9 @@ func (adh *adminHandlerImpl) ResendReplicationTasks(
 	if request == nil {
 		return adh.error(validate.ErrRequestNotSet, scope)
 	}
-	remoteAdminClient, err := adh.GetRemoteAdminClient(request.GetRemoteCluster())
-	if err != nil {
-		return adh.error(&types.BadRequestError{Message: err.Error()}, scope)
-	}
 	resender := ndc.NewHistoryResender(
 		adh.GetDomainCache(),
-		remoteAdminClient,
+		adh.GetClientBean(),
 		func(ctx context.Context, request *types.ReplicateEventsV2Request) error {
 			return adh.GetHistoryClient().ReplicateEventsV2(ctx, request)
 		},
@@ -1308,6 +1304,7 @@ func (adh *adminHandlerImpl) ResendReplicationTasks(
 		adh.GetLogger(),
 	)
 	return resender.SendSingleWorkflowHistory(
+		request.GetRemoteCluster(),
 		request.DomainID,
 		request.GetWorkflowID(),
 		request.GetRunID(),

@@ -21,6 +21,7 @@
 package cache
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -673,7 +674,7 @@ func (s *domainCacheSuite) TestStart_Stop() {
 }
 
 func (s *domainCacheSuite) TestStart_Error() {
-	mockLogger := &log.MockLogger{}
+	mockLogger := log.NewMockLogger(s.T())
 	s.domainCache.logger = mockLogger
 
 	s.Equal(domainCacheInitialized, s.domainCache.status)
@@ -903,8 +904,9 @@ func (s *domainCacheSuite) Test_refreshDomainsLocked_IntervalTooShort() {
 	s.domainCache.timeSource = mockedTimeSource
 
 	s.domainCache.lastRefreshTime = mockedTimeSource.Now()
+	ctx := context.Background()
 
-	err := s.domainCache.refreshDomainsLocked()
+	err := s.domainCache.refreshDomainsLocked(ctx)
 	s.NoError(err)
 }
 
