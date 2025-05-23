@@ -18,7 +18,7 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-package main
+package timeractivityloop
 
 import (
 	"context"
@@ -31,28 +31,28 @@ import (
 	"github.com/uber/cadence/simulation/replication/types"
 )
 
-func TestWorkflow(ctx workflow.Context, input types.WorkflowInput) (types.WorkflowOutput, error) {
+func Workflow(ctx workflow.Context, input types.WorkflowInput) (types.WorkflowOutput, error) {
 	logger := workflow.GetLogger(ctx)
-	logger.Sugar().Infof("testWorkflow started with input: %+v", input)
+	logger.Sugar().Infof("timer-activity-loop-workflow started with input: %+v", input)
 
 	endTime := workflow.Now(ctx).Add(input.Duration)
 	count := 0
 	for {
-		logger.Sugar().Infof("testWorkflow iteration %d", count)
+		logger.Sugar().Infof("timer-activity-loop-workflow iteration %d", count)
 		selector := workflow.NewSelector(ctx)
 		activityFuture := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 			TaskList:               types.TasklistName,
 			ScheduleToStartTimeout: 10 * time.Second,
 			StartToCloseTimeout:    10 * time.Second,
-		}), types.ActivityName, "World")
+		}), FormatStringActivity, "World")
 		selector.AddFuture(activityFuture, func(f workflow.Future) {
-			logger.Info("testWorkflow completed activity")
+			logger.Info("timer-activity-loop-workflow completed activity")
 		})
 
 		// use timer future to send notification email if processing takes too long
 		timerFuture := workflow.NewTimer(ctx, types.TimerInterval)
 		selector.AddFuture(timerFuture, func(f workflow.Future) {
-			logger.Info("testWorkflow timer fired")
+			logger.Info("timer-activity-loop-workflow timer fired")
 		})
 
 		// wait for both activity and timer to complete
@@ -62,19 +62,19 @@ func TestWorkflow(ctx workflow.Context, input types.WorkflowInput) (types.Workfl
 
 		now := workflow.Now(ctx)
 		if now.Before(endTime) {
-			logger.Sugar().Infof("testWorkflow will continue iteration because [now %v] < [endTime %v]", now, endTime)
+			logger.Sugar().Infof("timer-activity-loop-workflow will continue iteration because [now %v] < [endTime %v]", now, endTime)
 		} else {
-			logger.Sugar().Infof("testWorkflow will exit because [now %v] >= [endTime %v]", now, endTime)
+			logger.Sugar().Infof("timer-activity-loop-workflow will exit because [now %v] >= [endTime %v]", now, endTime)
 			break
 		}
 	}
 
-	logger.Info("testWorkflow completed")
+	logger.Info("timer-activity-loop-workflow completed")
 	return types.WorkflowOutput{Count: count}, nil
 }
 
-func TestActivity(ctx context.Context, input string) (string, error) {
+func FormatStringActivity(ctx context.Context, input string) (string, error) {
 	logger := activity.GetLogger(ctx)
-	logger.Info("testActivity started")
+	logger.Info("timer-activity-loop-workflow format-string-activity started")
 	return fmt.Sprintf("Hello, %s!", input), nil
 }

@@ -267,7 +267,7 @@ func (p *taskProcessorImpl) cleanupReplicationTaskLoop() {
 func (p *taskProcessorImpl) cleanupAckedReplicationTasks() error {
 	minAckLevel := int64(math.MaxInt64)
 	for clusterName := range p.shard.GetClusterMetadata().GetRemoteClusterInfo() {
-		ackLevel := p.shard.GetQueueClusterAckLevel(persistence.HistoryTaskCategoryReplication, clusterName).TaskID
+		ackLevel := p.shard.GetQueueClusterAckLevel(persistence.HistoryTaskCategoryReplication, clusterName).GetTaskID()
 		if ackLevel < minAckLevel {
 			minAckLevel = ackLevel
 		}
@@ -278,18 +278,16 @@ func (p *taskProcessorImpl) cleanupAckedReplicationTasks() error {
 		metrics.TargetClusterTag(p.currentCluster),
 	).RecordTimer(
 		metrics.ReplicationTasksLag,
-		time.Duration(p.shard.UpdateIfNeededAndGetQueueMaxReadLevel(persistence.HistoryTaskCategoryReplication, p.currentCluster).TaskID-minAckLevel),
+		time.Duration(p.shard.UpdateIfNeededAndGetQueueMaxReadLevel(persistence.HistoryTaskCategoryReplication, p.currentCluster).GetTaskID()-minAckLevel),
 	)
 	for {
 		pageSize := p.config.ReplicatorTaskDeleteBatchSize()
 		resp, err := p.shard.GetExecutionManager().RangeCompleteHistoryTask(
 			context.Background(),
 			&persistence.RangeCompleteHistoryTaskRequest{
-				TaskCategory: persistence.HistoryTaskCategoryReplication,
-				ExclusiveMaxTaskKey: persistence.HistoryTaskKey{
-					TaskID: minAckLevel + 1,
-				},
-				PageSize: pageSize,
+				TaskCategory:        persistence.HistoryTaskCategoryReplication,
+				ExclusiveMaxTaskKey: persistence.NewImmediateTaskKey(minAckLevel + 1),
+				PageSize:            pageSize,
 			},
 		)
 		if err != nil {
@@ -395,12 +393,12 @@ func (p *taskProcessorImpl) handleSyncShardStatus(status *types.SyncShardStatus)
 }
 
 func (p *taskProcessorImpl) processSingleTask(replicationTask *types.ReplicationTask) error {
-	retryTransientError := func() error {
+	retryTransientError := func(ctx context.Context) error {
 		throttleRetry := backoff.NewThrottleRetry(
 			backoff.WithRetryPolicy(p.taskRetryPolicy),
 			backoff.WithRetryableError(isTransientRetryableError),
 		)
-		return throttleRetry.Do(context.Background(), func() error {
+		return throttleRetry.Do(ctx, func(ctx context.Context) error {
 			select {
 			case <-p.done:
 				// if the processor is stopping, skip the task
@@ -467,7 +465,7 @@ func (p *taskProcessorImpl) processTaskOnce(replicationTask *types.ReplicationTa
 	scope, err := p.taskExecutor.execute(replicationTask, false)
 
 	if err != nil {
-		p.updateFailureMetric(scope, err)
+		p.updateFailureMetric(scope, err, p.shard.GetShardID())
 	} else {
 		now := ts.Now()
 		mScope := p.metricsClient.Scope(scope, metrics.TargetClusterTag(p.sourceCluster))
@@ -479,8 +477,6 @@ func (p *taskProcessorImpl) processTaskOnce(replicationTask *types.ReplicationTa
 			}
 			mScope = mScope.Tagged(metrics.DomainTag(domainName))
 		}
-		// emit the number of replication tasks
-		mScope.IncCounter(metrics.ReplicationTasksAppliedPerDomain)
 		// emit single task processing latency
 		mScope.RecordTimer(metrics.TaskProcessingLatency, now.Sub(startTime))
 		// emit latency from task generated to task received
@@ -488,6 +484,11 @@ func (p *taskProcessorImpl) processTaskOnce(replicationTask *types.ReplicationTa
 			metrics.ReplicationTaskLatency,
 			now.Sub(time.Unix(0, replicationTask.GetCreationTime())),
 		)
+		// emit the number of replication tasks
+		mScope.IncCounter(metrics.ReplicationTasksAppliedPerDomain)
+		shardScope := p.metricsClient.Scope(scope, metrics.TargetClusterTag(p.sourceCluster), metrics.InstanceTag(strconv.Itoa(p.shard.GetShardID())))
+		shardScope.IncCounter(metrics.ReplicationTasksApplied)
+
 	}
 
 	return err
@@ -507,8 +508,8 @@ func (p *taskProcessorImpl) putReplicationTaskToDLQ(request *persistence.PutRepl
 		backoff.WithRetryableError(p.shouldRetryDLQ),
 	)
 	// The following is guaranteed to success or retry forever until processor is shutdown.
-	return throttleRetry.Do(context.Background(), func() error {
-		err := p.shard.GetExecutionManager().PutReplicationTaskToDLQ(context.Background(), request)
+	return throttleRetry.Do(context.Background(), func(ctx context.Context) error {
+		err := p.shard.GetExecutionManager().PutReplicationTaskToDLQ(ctx, request)
 		if err != nil {
 			p.logger.Error("Failed to put replication task to DLQ.", tag.Error(err))
 			p.metricsClient.IncCounter(metrics.ReplicationTaskFetcherScope, metrics.ReplicationDLQFailed)
@@ -662,29 +663,30 @@ func (p *taskProcessorImpl) shouldRetryDLQ(err error) bool {
 	}
 }
 
-func (p *taskProcessorImpl) updateFailureMetric(scope int, err error) {
+func (p *taskProcessorImpl) updateFailureMetric(scope int, err error, shardID int) {
 	// Always update failure counter for all replicator errors
-	p.metricsClient.IncCounter(scope, metrics.ReplicatorFailures)
+	shardScope := p.metricsClient.Scope(scope, metrics.InstanceTag(strconv.Itoa(shardID)))
+	shardScope.IncCounter(metrics.ReplicatorFailures)
 
 	// Also update counter to distinguish between type of failures
 	switch err := err.(type) {
 	case *types.ShardOwnershipLostError:
-		p.metricsClient.IncCounter(scope, metrics.CadenceErrShardOwnershipLostCounter)
+		shardScope.IncCounter(metrics.CadenceErrShardOwnershipLostCounter)
 	case *types.BadRequestError:
-		p.metricsClient.IncCounter(scope, metrics.CadenceErrBadRequestCounter)
+		shardScope.IncCounter(metrics.CadenceErrBadRequestCounter)
 	case *types.DomainNotActiveError:
-		p.metricsClient.IncCounter(scope, metrics.CadenceErrDomainNotActiveCounter)
+		shardScope.IncCounter(metrics.CadenceErrDomainNotActiveCounter)
 	case *types.WorkflowExecutionAlreadyStartedError:
-		p.metricsClient.IncCounter(scope, metrics.CadenceErrExecutionAlreadyStartedCounter)
+		shardScope.IncCounter(metrics.CadenceErrExecutionAlreadyStartedCounter)
 	case *types.EntityNotExistsError:
-		p.metricsClient.IncCounter(scope, metrics.CadenceErrEntityNotExistsCounter)
+		shardScope.IncCounter(metrics.CadenceErrEntityNotExistsCounter)
 	case *types.WorkflowExecutionAlreadyCompletedError:
-		p.metricsClient.IncCounter(scope, metrics.CadenceErrWorkflowExecutionAlreadyCompletedCounter)
+		shardScope.IncCounter(metrics.CadenceErrWorkflowExecutionAlreadyCompletedCounter)
 	case *types.LimitExceededError:
-		p.metricsClient.IncCounter(scope, metrics.CadenceErrLimitExceededCounter)
+		shardScope.IncCounter(metrics.CadenceErrLimitExceededCounter)
 	case *yarpcerrors.Status:
 		if err.Code() == yarpcerrors.CodeDeadlineExceeded {
-			p.metricsClient.IncCounter(scope, metrics.CadenceErrContextTimeoutCounter)
+			shardScope.IncCounter(metrics.CadenceErrContextTimeoutCounter)
 		}
 	}
 }

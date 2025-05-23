@@ -373,10 +373,19 @@ $(BUILD)/proto-lint: $(PROTO_FILES) $(STABLE_BIN)/$(BUF_VERSION_BIN) | $(BUILD)
 # lints that go modules are as expected, e.g. parent does not import submodule.
 # tool builds that need to be in sync with the parent are partially checked through go_mod_build_tool, but should probably be checked here too
 $(BUILD)/gomod-lint: go.mod internal/tools/go.mod common/archiver/gcloud/go.mod | $(BUILD)
-	$Q # this is likely impossible as it'd be a cycle
-	$Q if grep github.com/uber/cadence/common/archiver/gcloud go.mod; then echo "gcloud submodule cannot be imported by main module" >&2; exit 1; fi
-	$Q # intentionally kept separate so the server does not include tool-only dependencies
-	$Q if grep github.com/uber/cadence/internal go.mod; then echo "internal module cannot be imported by main module" >&2; exit 1; fi
+	$Q echo "checking for direct submodule dependencies in root go.mod..."
+	$Q ( \
+		MAIN_MODULE=$$(grep "^module " go.mod | awk '{print $$2}'); \
+		SUBMODULES=$$(find . -type f -name "go.mod" -not -path "./go.mod" -not -path "./idls/*" -exec dirname {} \; | sed 's|^\./||'); \
+		for submodule in $$SUBMODULES; do \
+			submodule_path="$$MAIN_MODULE/$$submodule"; \
+			if grep -q "$$submodule_path" go.mod; then \
+				echo "ERROR: Root go.mod directly depends on submodule: $$submodule_path" >&2; \
+				exit 1; \
+			fi; \
+			echo "✓ No direct dependency on $$submodule"; \
+		done; \
+	)
 	$Q touch $@
 
 # note that LINT_SRC is fairly fake as a prerequisite.
@@ -559,9 +568,10 @@ tidy: ## `go mod tidy` all packages
 	$Q cd common/archiver/gcloud; go mod tidy || (echo "failed to tidy gcloud plugin, try manually copying go.mod contents into common/archiver/gcloud/go.mod and rerunning" >&2; exit 1)
 	$Q cd cmd/server; go mod tidy || (echo "failed to tidy main server module, try manually copying go.mod and common/archiver/gcloud/go.mod contents into cmd/server/go.mod and rerunning" >&2; exit 1)
 
-clean: ## Clean build products
+clean: ## Clean build products and SQLite database
 	rm -f $(BINS)
 	rm -Rf $(BUILD)
+	rm *.db
 	$(if \
 		$(wildcard $(STABLE_BIN)/*), \
 		$(warning usually-stable build tools still exist, delete the $(STABLE_BIN) folder to rebuild them),)
@@ -759,6 +769,12 @@ install-schema-postgres: cadence-sql-tool
 	./cadence-sql-tool -p 5432 -u postgres -pw cadence --pl postgres create --db cadence_visibility
 	./cadence-sql-tool -p 5432 -u postgres -pw cadence --pl postgres --db cadence_visibility setup-schema -v 0.0
 	./cadence-sql-tool -p 5432 -u postgres -pw cadence --pl postgres --db cadence_visibility update-schema -d ./schema/postgres/visibility/versioned
+
+install-schema-sqlite: cadence-sql-tool
+	./cadence-sql-tool -pl sqlite --db cadence.db setup -v 0.0
+	./cadence-sql-tool -pl sqlite --db cadence.db update-schema -d ./schema/sqlite/cadence/versioned
+	./cadence-sql-tool -pl sqlite --db cadence_visibility.db setup -v 0.0
+	./cadence-sql-tool -pl sqlite --db cadence_visibility.db update-schema -d ./schema/sqlite/visibility/versioned
 
 install-schema-es-v7:
 	curl -X PUT "http://127.0.0.1:9200/_template/cadence-visibility-template" -H 'Content-Type: application/json' -d @./schema/elasticsearch/v7/visibility/index_template.json

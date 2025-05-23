@@ -86,12 +86,12 @@ func (t *MatcherTestSuite) SetupTest() {
 	}
 	t.cfg = tlCfg
 	t.isolationGroups = []string{"dca1", "dca2"}
-	t.fwdr = newForwarder(&t.cfg.ForwarderConfig, t.taskList, types.TaskListKindNormal, t.client, metrics.NoopScope(metrics.Matching))
-	t.matcher = newTaskMatcher(tlCfg, t.fwdr, metrics.NoopScope(metrics.Matching), []string{"dca1", "dca2"}, log.NewNoop(), t.taskList, types.TaskListKindNormal, func(cfg *config.TaskListConfig) int { return tlCfg.NumReadPartitions() }).(*taskMatcherImpl)
+	t.fwdr = newForwarder(&t.cfg.ForwarderConfig, t.taskList, types.TaskListKindNormal, t.client, metrics.NoopScope)
+	t.matcher = newTaskMatcher(tlCfg, t.fwdr, metrics.NoopScope, []string{"dca1", "dca2"}, log.NewNoop(), t.taskList, types.TaskListKindNormal, func(cfg *config.TaskListConfig) int { return tlCfg.NumReadPartitions() }).(*taskMatcherImpl)
 
 	rootTaskList := NewTestTaskListID(t.T(), t.taskList.GetDomainID(), t.taskList.Parent(20), persistence.TaskListTypeDecision)
 	rootTasklistCfg := newTaskListConfig(rootTaskList, cfg, testDomainName)
-	t.rootMatcher = newTaskMatcher(rootTasklistCfg, nil, metrics.NoopScope(metrics.Matching), []string{"dca1", "dca2"}, log.NewNoop(), t.taskList, types.TaskListKindNormal, func(cfg *config.TaskListConfig) int { return tlCfg.NumReadPartitions() }).(*taskMatcherImpl)
+	t.rootMatcher = newTaskMatcher(rootTasklistCfg, nil, metrics.NoopScope, []string{"dca1", "dca2"}, log.NewNoop(), t.taskList, types.TaskListKindNormal, func(cfg *config.TaskListConfig) int { return tlCfg.NumReadPartitions() }).(*taskMatcherImpl)
 }
 
 func (t *MatcherTestSuite) TearDownTest() {
@@ -568,12 +568,28 @@ func (t *MatcherTestSuite) TestPollersDisconnectedAfterDisconnectBlockedPollers(
 	t.disableRemoteForwarding()
 	t.matcher.DisconnectBlockedPollers()
 
-	longPollingCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	longPollingCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
 
 	task, err := t.matcher.Poll(longPollingCtx, "")
 	t.ErrorIs(err, ErrNoTasks, "closed matcher should result in no tasks")
 	t.Nil(task)
+	t.NoError(longPollingCtx.Err(), "the parent context was not cancelled, the child context was cancelled")
+}
+
+func (t *MatcherTestSuite) TestPollersConnectedAfterDisconnectBlockedPollersSetCancelContext() {
+	defer goleak.VerifyNone(t.T())
+	t.disableRemoteForwarding()
+	t.matcher.DisconnectBlockedPollers()
+	t.matcher.RefreshCancelContext()
+
+	longPollingCtx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel()
+
+	task, err := t.matcher.Poll(longPollingCtx, "")
+	t.ErrorIs(err, ErrNoTasks, "no tasks to be matched to poller")
+	t.Nil(task)
+	t.ErrorIs(longPollingCtx.Err(), context.DeadlineExceeded, "the child context wasn't cancelled, the parent context timed out")
 }
 
 func (t *MatcherTestSuite) TestRemotePoll() {

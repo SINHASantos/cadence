@@ -252,9 +252,15 @@ func (d *handlerImpl) RegisterDomain(
 		VisibilityArchivalURI:    nextVisibilityArchivalState.URI,
 		BadBinaries:              types.BadBinaries{Binaries: map[string]*types.BadBinaryInfo{}},
 	}
+
+	activeClusters, err := d.activeClustersFromRegisterRequest(registerRequest)
+	if err != nil {
+		return err
+	}
 	replicationConfig := &persistence.DomainReplicationConfig{
 		ActiveClusterName: activeClusterName,
 		Clusters:          clusters,
+		ActiveClusters:    activeClusters,
 	}
 	isGlobalDomain := registerRequest.GetIsGlobalDomain()
 
@@ -600,13 +606,33 @@ func (d *handlerImpl) DeleteDomain(
 	if err != nil {
 		return err
 	}
+	isGlobalDomain := getResponse.IsGlobalDomain
+	if isGlobalDomain && !d.clusterMetadata.IsPrimaryCluster() {
+		return errNotPrimaryCluster
+	}
+
 	deleteReq := &persistence.DeleteDomainByNameRequest{
 		Name: getResponse.Info.Name,
 	}
-
 	err = d.domainManager.DeleteDomainByName(ctx, deleteReq)
 	if err != nil {
 		return err
+	}
+
+	if isGlobalDomain {
+		if err := d.domainReplicator.HandleTransmissionTask(
+			ctx,
+			types.DomainOperationDelete,
+			getResponse.Info,
+			getResponse.Config,
+			getResponse.ReplicationConfig,
+			getResponse.ConfigVersion,
+			getResponse.FailoverVersion,
+			getResponse.PreviousFailoverVersion,
+			isGlobalDomain,
+		); err != nil {
+			return fmt.Errorf("unable to delete a domain in replica cluster: %v", err)
+		}
 	}
 
 	d.logger.Info("Delete domain succeeded",
@@ -1276,6 +1302,40 @@ func (d *handlerImpl) validateDomainReplicationConfigForUpdateDomain(
 	}
 
 	return nil
+}
+
+func (d *handlerImpl) activeClustersFromRegisterRequest(registerRequest *types.RegisterDomainRequest) (*types.ActiveClusters, error) {
+	if !registerRequest.GetIsGlobalDomain() || registerRequest.ActiveClustersByRegion == nil {
+		// local or active-passive domain
+		return nil, nil
+	}
+
+	// Initialize ActiveClustersByRegion with given cluster names and their initial failover versions
+	activeClustersByRegion := make(map[string]types.ActiveClusterInfo, len(registerRequest.ActiveClustersByRegion))
+	clusters := d.clusterMetadata.GetAllClusterInfo()
+	regions := d.clusterMetadata.GetAllRegionInfo()
+	for region, cluster := range registerRequest.ActiveClustersByRegion {
+		if _, ok := regions[region]; !ok {
+			return nil, &types.BadRequestError{
+				Message: fmt.Sprintf("Region %v not found. Domain cannot be registered in this region.", region),
+			}
+		}
+
+		clusterInfo, ok := clusters[cluster]
+		if !ok {
+			return nil, &types.BadRequestError{
+				Message: fmt.Sprintf("Cluster %v not found. Domain cannot be registered in this cluster.", cluster),
+			}
+		}
+
+		activeClustersByRegion[region] = types.ActiveClusterInfo{
+			ActiveClusterName: cluster,
+			FailoverVersion:   clusterInfo.InitialFailoverVersion,
+		}
+	}
+	return &types.ActiveClusters{
+		ActiveClustersByRegion: activeClustersByRegion,
+	}, nil
 }
 
 func getDomainStatus(info *persistence.DomainInfo) *types.DomainStatus {
